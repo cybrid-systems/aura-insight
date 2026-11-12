@@ -1,0 +1,9 @@
+.tools/
+data/
+out/
+__pycache__/
+*.pyc
+.aura/
+*.sqlite
+*.sqlite-journal
+.DS_Store

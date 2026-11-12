@@ -1,0 +1,101 @@
+[
+  {
+    "id": "e1",
+    "source": "fixture",
+    "repo": "cybrid-systems/aura",
+    "time": "2026-03-02T09:00:00Z",
+    "title": "Show source context in effect-denied errors",
+    "body": "effect-denied 报错只有一句权限不足，看不到是哪一段源码触发的。排障时要来回对行号。",
+    "labels": ["enhancement"],
+    "comments": ["复现：在 trial 子工作区里 set-code，报错不带 form。"],
+    "reactions": 2
+  },
+  {
+    "id": "e2",
+    "source": "fixture",
+    "repo": "cybrid-systems/aura",
+    "time": "2026-03-04T11:20:00Z",
+    "title": "effect-denied errors should include the source form",
+    "body": "同样是 effect-denied。希望错误对象里带上被拒绝的源码形式，而不是只给 tenant 和 op。",
+    "labels": ["enhancement"],
+    "comments": [],
+    "reactions": 3
+  },
+  {
+    "id": "w1",
+    "source": "fixture",
+    "repo": "cybrid-systems/aura-memory",
+    "time": "2026-03-06T08:10:00Z",
+    "title": "Replay a forked worldline in the trial gate",
+    "body": "策略候选要在分叉的 worldline 上重放，不能直接改正在服务的那条。",
+    "labels": ["enhancement"],
+    "comments": ["和 evo:trial 的子工作区是一回事，缺的是重放窗口。"],
+    "reactions": 4
+  },
+  {
+    "id": "w2",
+    "source": "fixture",
+    "repo": "cybrid-systems/aura-memory",
+    "time": "2026-03-07T16:40:00Z",
+    "title": "trial gate should replay the forked worldline",
+    "body": "现在 trial 只检查候选本身，没有把历史纠正再跑一遍。worldline 分叉后结果对不上。",
+    "labels": ["bug", "enhancement"],
+    "comments": [],
+    "reactions": 1
+  },
+  {
+    "id": "q1",
+    "source": "fixture",
+    "repo": "cybrid-systems/aura",
+    "time": "2026-02-11T03:05:00Z",
+    "title": "How do I install aura on Ubuntu?",
+    "body": "想在 Ubuntu 上装一下试试，文档入口有点难找。这是使用问题，不是功能需求。",
+    "labels": ["question"],
+    "comments": ["已用官方 release tarball 装好了。"],
+    "reactions": 40
+  },
+  {
+    "id": "q2",
+    "source": "fixture",
+    "repo": "cybrid-systems/aura-runner",
+    "time": "2026-02-18T19:12:00Z",
+    "title": "Can we add a funny mascot?",
+    "body": "随便问问，要不要加一个吉祥物。没有第二个人提过。",
+    "labels": ["question"],
+    "comments": [],
+    "reactions": 25
+  },
+  {
+    "id": "d1",
+    "source": "fixture",
+    "repo": "cybrid-systems/aura",
+    "time": "2026-04-01T10:00:00Z",
+    "title": "Document sandbox preset grants for operators",
+    "body": "sandbox 和 preset 的授权差在哪，运维同学只能看源码。需要一段对着命令的说明。",
+    "labels": ["documentation"],
+    "comments": ["尤其是 mutate 在工作区 0 和工作区 N 上的差别。"],
+    "reactions": 2
+  },
+  {
+    "id": "d2",
+    "source": "fixture",
+    "repo": "cybrid-systems/aura-harness",
+    "time": "2026-04-02T10:30:00Z",
+    "title": "Preset docs should explain sandbox grants",
+    "body": "preset 文档没有写 sandbox 打开之后哪些能力还在。对接 harness 时踩了坑。",
+    "labels": ["documentation", "enhancement"],
+    "comments": [],
+    "reactions": 1
+  },
+  {
+    "id": "d3",
+    "source": "fixture",
+    "repo": "cybrid-systems/aura-perf",
+    "time": "2026-04-03T12:15:00Z",
+    "title": "sandbox preset documentation is missing",
+    "body": "性能回归脚本要在 sandbox 里跑，preset 怎么配没有文档。",
+    "labels": ["documentation"],
+    "comments": [],
+    "reactions": 2
+  }
+]

@@ -1,0 +1,278 @@
+; 需求策略的可变部分：聚类、打分、晋升 / 遗忘。
+; 由 insight.aura 用 set-code 装进工作区。参数函数
+; policy-name / policy-min-support / policy-question-fake? / policy-reaction-bias
+; 必须写在本文件之前。
+;
+; 纯函数：禁止 hash-set!、vector-set!、set!。
+; evo:trial 的子工作区会拒绝这些写入（Aura #5163）。
+; 空列表经 json-encode 会变成 null（Aura #5160），宿主把已知列表字段的 null 还原成 []。
+
+(define (policy-knobs)
+  (hash "name" (policy-name)
+        "min_support" (policy-min-support)
+        "question_fake" (policy-question-fake?)
+        "reaction_bias" (policy-reaction-bias)))
+
+(define (policy-remember? item)
+  (and (hash? item) (eq? (hash-ref item "promote" #f) #t)))
+
+(define (as-list v)
+  (if (list? v) v (list)))
+
+(define (num v)
+  (if (number? v) (* 1.0 v) 0.0))
+
+(define (stopword? w)
+  (or (string=? w "should") (string=? w "please") (string=? w "include")
+      (string=? w "missing") (string=? w "explain") (string=? w "document")
+      (string=? w "documentation") (string=? w "operators") (string=? w "context")
+      (string=? w "about") (string=? w "after") (string=? w "again")
+      (string=? w "being") (string=? w "could") (string=? w "every")
+      (string=? w "first") (string=? w "their") (string=? w "there")
+      (string=? w "these") (string=? w "those") (string=? w "under")
+      (string=? w "where") (string=? w "which") (string=? w "while")
+      (string=? w "would") (string=? w "other") (string=? w "another")
+      (string=? w "really") (string=? w "maybe")))
+
+(define (all-digits? s)
+  (let loop ((i 0) (n (string-length s)))
+    (if (>= i n) #t
+      (let ((c (string-ref s i)))
+        (if (and (>= c 48) (<= c 57)) (loop (+ i 1) n) #f)))))
+
+(define (alpha-num? c)
+  (or (and (>= c 97) (<= c 122))
+      (and (>= c 48) (<= c 57))))
+
+(define (push-token buf acc)
+  (if (and (>= (string-length buf) 5)
+           (not (stopword? buf))
+           (not (all-digits? buf)))
+    (cons buf acc)
+    acc))
+
+(define (tokenize text)
+  (let* ((s (string-downcase (if (string? text) text "")))
+         (n (string-length s)))
+    (let loop ((i 0) (buf "") (acc (list)))
+      (if (>= i n)
+        (reverse (push-token buf acc))
+        (let ((c (string-ref s i)))
+          (if (alpha-num? c)
+            (loop (+ i 1) (string-append buf (substring s i (+ i 1))) acc)
+            (loop (+ i 1) "" (push-token buf acc))))))))
+
+(define (has-token? t xs)
+  (let loop ((ys xs))
+    (if (null? ys) #f
+      (if (string=? t (car ys)) #t (loop (cdr ys))))))
+
+(define (share-tokens? a b)
+  (let loop ((ts (hash-ref a "tokens" (list))))
+    (if (null? ts) #f
+      (if (has-token? (car ts) (hash-ref b "tokens" (list)))
+        #t
+        (loop (cdr ts))))))
+
+(define (concat groups)
+  (let loop ((gs groups) (acc (list)))
+    (if (null? gs) acc
+      (loop (cdr gs) (append acc (car gs))))))
+
+(define (shares-group? s g)
+  (let loop ((xs g))
+    (if (null? xs) #f
+      (if (share-tokens? s (car xs)) #t (loop (cdr xs))))))
+
+(define (insert-signal groups s)
+  (let loop ((gs groups) (hit (list)) (miss (list)))
+    (if (null? gs)
+      (cons (cons s (concat hit)) miss)
+      (if (shares-group? s (car gs))
+        (loop (cdr gs) (cons (car gs) hit) miss)
+        (loop (cdr gs) hit (cons (car gs) miss))))))
+
+(define (cluster-list items)
+  (let loop ((xs items) (groups (list)))
+    (if (null? xs) groups
+      (loop (cdr xs) (insert-signal groups (car xs))))))
+
+(define (string-labels xs)
+  (let loop ((ys (as-list xs)) (acc (list)))
+    (if (null? ys) (reverse acc)
+      (if (string? (car ys))
+        (loop (cdr ys) (cons (car ys) acc))
+        (loop (cdr ys) acc)))))
+
+(define (comment-count s)
+  (let ((listed (length (as-list (hash-ref s "comments" (list)))))
+        (given (hash-ref s "comment_count" 0)))
+    (max listed (if (number? given) given 0))))
+
+(define (excerpt s)
+  (if (not (string? s)) ""
+    (if (<= (string-length s) 180) s (substring s 0 180))))
+
+(define (first-string xs)
+  (let loop ((ys (as-list xs)))
+    (if (null? ys) ""
+      (if (string? (car ys)) (car ys) (loop (cdr ys))))))
+
+(define (annotate s)
+  (hash "id" (if (string? (hash-ref s "id" "")) (hash-ref s "id" "") "")
+        "title" (if (string? (hash-ref s "title" "")) (hash-ref s "title" "") "")
+        "body" (if (string? (hash-ref s "body" "")) (hash-ref s "body" "") "")
+        "repo" (if (string? (hash-ref s "repo" "")) (hash-ref s "repo" "") "")
+        "time" (if (string? (hash-ref s "time" "")) (hash-ref s "time" "") "")
+        "source" (if (string? (hash-ref s "source" "")) (hash-ref s "source" "") "")
+        "labels" (string-labels (hash-ref s "labels" (list)))
+        "reactions" (num (hash-ref s "reactions" 0))
+        "comments" (as-list (hash-ref s "comments" (list)))
+        "comment_count" (comment-count s)
+        "tokens" (tokenize (string-append
+                             (if (string? (hash-ref s "title" "")) (hash-ref s "title" "") "")
+                             " "
+                             (if (string? (hash-ref s "body" "")) (hash-ref s "body" "") "")))))
+
+(define (bad-label? s)
+  (let ((k (string-downcase s)))
+    (or (string=? k "question")
+        (string=? k "wontfix")
+        (string=? k "duplicate")
+        (string=? k "invalid"))))
+
+(define (group-question? group)
+  (let loop ((xs group))
+    (if (null? xs) #f
+      (let scan ((labs (hash-ref (car xs) "labels" (list))))
+        (if (null? labs)
+          (loop (cdr xs))
+          (if (bad-label? (car labs)) #t (scan (cdr labs))))))))
+
+(define (sum-reactions group)
+  (let loop ((xs group) (n 0.0))
+    (if (null? xs) n
+      (loop (cdr xs) (+ n (num (hash-ref (car xs) "reactions" 0)))))))
+
+(define (avg-reactions group)
+  (if (null? group) 0.0
+    (/ (sum-reactions group) (* 1.0 (length group)))))
+
+(define (insert-string x xs)
+  (if (null? xs) (list x)
+    (if (string<? x (car xs))
+      (cons x xs)
+      (cons (car xs) (insert-string x (cdr xs))))))
+
+(define (sort-strings xs)
+  (let loop ((ys xs) (acc (list)))
+    (if (null? ys) acc
+      (loop (cdr ys) (insert-string (car ys) acc)))))
+
+(define (group-ids group)
+  (sort-strings (map (lambda (s) (hash-ref s "id" "")) group)))
+
+(define (signal-by-id group id)
+  (let loop ((xs group))
+    (if (null? xs) #f
+      (if (string=? (hash-ref (car xs) "id" "") id) (car xs)
+        (loop (cdr xs))))))
+
+(define (union-labels group)
+  (let loop ((gs group) (acc (list)))
+    (if (null? gs) acc
+      (loop (cdr gs)
+            (let add ((labs (hash-ref (car gs) "labels" (list))) (out acc))
+              (if (null? labs) out
+                (if (has-token? (car labs) out)
+                  (add (cdr labs) out)
+                  (add (cdr labs) (append out (list (car labs)))))))))))
+
+(define (public-signal s)
+  (hash "id" (hash-ref s "id" "")
+        "source" (hash-ref s "source" "")
+        "repo" (hash-ref s "repo" "")
+        "time" (hash-ref s "time" "")
+        "title" (hash-ref s "title" "")
+        "body" (excerpt (hash-ref s "body" ""))
+        "labels" (hash-ref s "labels" (list))
+        "reactions" (hash-ref s "reactions" 0)
+        "comment_count" (hash-ref s "comment_count" 0)
+        "sample_comment" (first-string (hash-ref s "comments" (list)))))
+
+(define (evidence-of group ids)
+  (let loop ((xs ids) (acc (list)))
+    (if (null? xs) (reverse acc)
+      (let ((s (signal-by-id group (car xs))))
+        (loop (cdr xs) (if s (cons (public-signal s) acc) acc))))))
+
+(define (title-of group ids)
+  (let ((s (signal-by-id group (car ids))))
+    (if s (hash-ref s "title" "") "")))
+
+(define (want-promote? support question?)
+  (if (and (policy-question-fake?) question?)
+    #f
+    (>= support (policy-min-support))))
+
+(define (confidence-of support avg-react question? promote?)
+  (cond
+    ((and (policy-question-fake?) question?) 0.12)
+    ((not promote?) 0.2)
+    (else
+     (let ((raw (+ 0.4 (+ (* 0.1 (* 1.0 support))
+                          (* (policy-reaction-bias) avg-react)))))
+       (if (> raw 0.95) 0.95 raw)))))
+
+(define (why-of support question? promote? confidence)
+  (string-append
+    "策略 " (policy-name)
+    "：最少证据 " (number->string (policy-min-support))
+    "，问句视为伪需求 " (if (policy-question-fake?) "是" "否")
+    "，反应权重 " (number->string (policy-reaction-bias))
+    "。本簇 " (number->string support) " 条信号"
+    (if question? "，含 question/wontfix/duplicate/invalid 标签" "")
+    "。"
+    (cond
+      ((and (policy-question-fake?) question?)
+       "问句或无效标签被判为伪需求，不晋升。")
+      ((not promote?)
+       "证据条数低于阈值，不晋升。")
+      (else
+       "达到阈值，晋升为真实需求。"))
+    "置信度 " (number->string confidence) "。"))
+
+(define (judge group)
+  (let* ((ids (group-ids group))
+         (support (length group))
+         (question? (group-question? group))
+         (avg-react (avg-reactions group))
+         (promote? (want-promote? support question?))
+         (confidence (confidence-of support avg-react question? promote?))
+         (kind (if promote? "real" "fake"))
+         (priority (if promote? (* confidence (* 1.0 support)) 0.0))
+         (title (title-of group ids)))
+    (hash "id" (string-append "c-" (let join ((xs ids) (acc ""))
+                                      (if (null? xs) acc
+                                        (join (cdr xs)
+                                              (if (string=? acc "")
+                                                (car xs)
+                                                (string-append acc "-" (car xs)))))))
+          "signal_ids" ids
+          "description" (string-append
+                          (if promote? "真实需求假设： " "未晋升假设： ")
+                          title)
+          "kind" kind
+          "promote" promote?
+          "confidence" confidence
+          "priority" priority
+          "support" support
+          "question" question?
+          "reactions" (sum-reactions group)
+          "labels" (union-labels group)
+          "why" (why-of support question? promote? confidence)
+          "evidence" (evidence-of group ids))))
+
+(define (policy-assess signals)
+  (let ((items (map annotate (as-list signals))))
+    (map judge (cluster-list items))))
