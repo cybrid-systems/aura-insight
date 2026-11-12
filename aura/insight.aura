@@ -1,0 +1,635 @@
+; 需求洞察的 Aura 控制面。
+; 宿主把信号、反馈和当前策略源写进 INSIGHT_IN，本程序把一个 JSON 对象写到
+; stdout，并写到 INSIGHT_OUT。不要往 stdout 打别的东西。
+;
+; 闭环：observe → propose（fiber）→ check（证据门槛 + agent:check）
+;       → evo:trial 在子工作区重放 → evo:commit! 只在严格更优时 KEEP
+;       → 发布走 mutate:atomic-batch-safe（MutationBoundary）→ 再打分验证。
+;
+; v0.2.0 约束（钉 cf7353373ea276bc03e8364592814382ebd62539）：
+; - Restricted 沙箱只给工作区 0 mutate，trial 子工作区 set-code 会被拒绝。
+;   因此宿主必须 AURA_SANDBOX=off。--preset dev 仍然带上。
+; - trial 之后父工作区 mutate:rebind 在 restricted 下会 cow-refused（#5162）。
+;   sandbox off 下原子 rebind 可用；失败则退回 set-code，并记在 publish_via。
+; - 子工作区禁止 hash-set! / vector-set!（#5163）。策略与打分都是纯函数。
+; - json-encode 把空列表编成 null（#5160）。宿主还原已知列表字段。
+; - 不使用 aura::eval C ABI，也不使用 aura --serve。
+
+(require "std/evo-core" all:)
+(require "std/evo" all:)
+(require "std/mutate" all:)
+(require "std/agent" all:)
+(require "std/orch" all:)
+
+; 文件级桩。set-code 装入的工作区定义会盖住它们；编译期需要这些名字。
+(define (policy-name) "unset")
+(define (policy-min-support) 1)
+(define (policy-question-fake?) #f)
+(define (policy-reaction-bias) 0.05)
+(define (policy-knobs)
+  (hash "name" (policy-name)
+        "min_support" (policy-min-support)
+        "question_fake" (policy-question-fake?)
+        "reaction_bias" (policy-reaction-bias)))
+(define (policy-remember? item) #f)
+(define (policy-assess signals) (list))
+
+(define policy-lib-text "")
+(define active-source "")
+(define publish-via "none")
+
+(define (err-text e)
+  (if (string? e) e "error"))
+
+(define (load-lib!)
+  (set! policy-lib-text (read-file "aura/policy_lib.aura"))
+  policy-lib-text)
+
+(define (render-policy name min-sup qfake bias)
+  (string-append
+    "(define (policy-name) \"" name "\")\n"
+    "(define (policy-min-support) " (number->string min-sup) ")\n"
+    "(define (policy-question-fake?) " (if qfake "#t" "#f") ")\n"
+    "(define (policy-reaction-bias) " bias ")\n"
+    policy-lib-text
+    "\n0\n"))
+
+(define (seed-source)
+  (render-policy "seed" 1 #f "0.05"))
+
+(define (install! src)
+  (if (set-code src)
+    (begin
+      (eval-current)
+      (set! active-source src)
+      #t)
+    #f))
+
+(define (as-list v)
+  (if (list? v) v (list)))
+
+(define (incoming-source input)
+  (let ((src (hash-ref input "policy_source" "")))
+    (if (and (string? src) (> (string-length src) 0))
+      src
+      (seed-source))))
+
+(define (incoming-version input)
+  (let ((v (hash-ref input "policy_version" 0)))
+    (if (and (integer? v) (>= v 1)) v 0)))
+
+(define (verdict-of f) (hash-ref f "verdict" ""))
+(define (insight-of f) (hash-ref f "insight_id" ""))
+
+(define (held? f)
+  (eq? (hash-ref f "held_out" #f) #t))
+
+(define (count-verdict feedback v)
+  (let loop ((xs (as-list feedback)) (n 0))
+    (if (null? xs) n
+      (loop (cdr xs)
+            (+ n (if (string=? (verdict-of (car xs)) v) 1 0))))))
+
+(define (enough? feedback)
+  (and (>= (count-verdict feedback "deny") 1)
+       (>= (count-verdict feedback "confirm") 2)))
+
+(define (find-row id rows)
+  (let loop ((xs rows))
+    (if (null? xs) #f
+      (if (string=? (hash-ref (car xs) "id" "") id)
+        (car xs)
+        (loop (cdr xs))))))
+
+(define (promoted-real? row)
+  (and (hash? row)
+       (eq? (hash-ref row "promote" #f) #t)
+       (string=? (hash-ref row "kind" "") "real")))
+
+(define (label-match? f row)
+  (let ((v (verdict-of f)))
+    (cond
+      ((string=? v "confirm") (promoted-real? row))
+      ((string=? v "deny") (not (promoted-real? row)))
+      (else #t))))
+
+(define (tally feedback rows pred)
+  (let loop ((xs (as-list feedback)) (hit 0) (n 0))
+    (if (null? xs)
+      (hash "hit" hit "n" n
+            "rate" (if (= n 0) 1.0 (/ (* 1.0 hit) n)))
+      (let ((f (car xs)))
+        (if (not (and (pred f)
+                      (or (string=? (verdict-of f) "confirm")
+                          (string=? (verdict-of f) "deny"))))
+          (loop (cdr xs) hit n)
+          (loop (cdr xs)
+                (+ hit (if (label-match? f (find-row (insight-of f) rows)) 1 0))
+                (+ n 1)))))))
+
+(define (score-rows rows feedback)
+  (let ((all (tally feedback rows (lambda (f) #t)))
+        (held (tally feedback rows held?)))
+    (hash "total" (hash-ref all "rate" 0.0)
+          "labeled" (hash-ref all "n" 0)
+          "heldout" (hash-ref held "rate" 0.0)
+          "heldout_labeled" (hash-ref held "n" 0))))
+
+(define (score-current signals feedback)
+  (score-rows (policy-assess signals) feedback))
+
+(define (better? now base)
+  (and (> (hash-ref now "total" 0.0) (hash-ref base "total" 0.0))
+       (>= (hash-ref now "heldout" 0.0) (hash-ref base "heldout" 0.0))))
+
+(define (notes-for id feedback)
+  (let loop ((xs (as-list feedback)) (acc (list)))
+    (if (null? xs) (reverse acc)
+      (let ((f (car xs)))
+        (if (and (string=? (insight-of f) id)
+                 (string=? (verdict-of f) "supplement")
+                 (string? (hash-ref f "note" ""))
+                 (> (string-length (hash-ref f "note" "")) 0))
+          (loop (cdr xs) (cons (hash-ref f "note" "") acc))
+          (loop (cdr xs) acc))))))
+
+(define (with-notes rows feedback)
+  (map (lambda (row)
+         (hash-set row "notes" (notes-for (hash-ref row "id" "") feedback)))
+       rows))
+
+(define (before-row? a b)
+  (let ((pa (hash-ref a "priority" 0))
+        (pb (hash-ref b "priority" 0)))
+    (if (= pa pb)
+      (string<? (hash-ref a "id" "") (hash-ref b "id" ""))
+      (> pa pb))))
+
+(define (insert-row x xs)
+  (if (null? xs) (list x)
+    (if (before-row? x (car xs))
+      (cons x xs)
+      (cons (car xs) (insert-row x (cdr xs))))))
+
+(define (sort-rows xs)
+  (let loop ((ys xs) (acc (list)))
+    (if (null? ys) acc
+      (loop (cdr ys) (insert-row (car ys) acc)))))
+
+(define (partition-rows rows)
+  (let loop ((xs rows) (hot (list)) (cold (list)))
+    (if (null? xs)
+      (hash "insights" (sort-rows hot) "forgotten" (sort-rows cold))
+      (if (promoted-real? (car xs))
+        (loop (cdr xs) (cons (car xs) hot) cold)
+        (loop (cdr xs) hot (cons (car xs) cold))))))
+
+(define (stamp rows version)
+  (map (lambda (row)
+         (hash-set (hash-set row "policy_version" version)
+                   "policy_name" (policy-name)))
+       rows))
+
+(define (remembered rows)
+  (let loop ((xs rows) (acc (list)))
+    (if (null? xs) (reverse acc)
+      (if (policy-remember? (car xs))
+        (loop (cdr xs) (cons (hash-ref (car xs) "id" "") acc))
+        (loop (cdr xs) acc)))))
+
+(define (metrics-of now base)
+  (hash "agreement" (hash-ref now "total" 0.0)
+        "base_agreement" (hash-ref base "total" 0.0)
+        "heldout" (hash-ref now "heldout" 0.0)
+        "base_heldout" (hash-ref base "heldout" 0.0)
+        "labeled" (hash-ref now "labeled" 0)
+        "heldout_labeled" (hash-ref now "heldout_labeled" 0)))
+
+(define (fmt-rate x)
+  (let ((s (number->string (exact->inexact x))))
+    (if (> (string-length s) 6) (substring s 0 6) s)))
+
+(define (present signals feedback version decision reason gate trials now base)
+  (let* ((rows (with-notes (policy-assess signals) feedback))
+         (parts (partition-rows rows))
+         (knobs (policy-knobs)))
+    (hash "ok" #t
+          "decision" decision
+          "reason" reason
+          "gate" gate
+          "policy_version" version
+          "policy_name" (hash-ref knobs "name" "")
+          "policy_source" active-source
+          "knobs" knobs
+          "insights" (stamp (hash-ref parts "insights" (list)) version)
+          "forgotten" (stamp (hash-ref parts "forgotten" (list)) version)
+          "memory" (remembered rows)
+          "metrics" (metrics-of now base)
+          "trials" trials
+          "publish_via" publish-via)))
+
+(define (spec-overstrict)
+  (hash "arm" "overstrict"
+        "name" "overstrict"
+        "min" 4
+        "fake" #f
+        "bias" "0.05"
+        "thought" "把晋升阈值抬到 4。支持 2 到 3 条的真实需求会被丢掉，问句仍当真实需求。"))
+
+(define (spec-stricter)
+  (hash "arm" "stricter"
+        "name" "stricter"
+        "min" 2
+        "fake" #t
+        "bias" "0.02"
+        "thought" "至少 2 条证据才晋升，问句视为伪需求，并降低反应数权重。"))
+
+(define (spec-of arm)
+  (cond
+    ((equal? arm "overstrict") (spec-overstrict))
+    ((equal? arm "stricter") (spec-stricter))
+    (else #f)))
+
+(define (ucb-rows)
+  (list
+    (list (cons "arm" "overstrict") (cons "n" 0) (cons "keeps" 0) (cons "mean" 0.0))
+    (list (cons "arm" "stricter") (cons "n" 0) (cons "keeps" 0) (cons "mean" 0.0))))
+
+(define (make-cand spec)
+  (evo:candidate
+    (render-policy (hash-ref spec "name")
+                   (hash-ref spec "min")
+                   (hash-ref spec "fake")
+                   (hash-ref spec "bias"))
+    (hash "id" (hash-ref spec "arm")
+          "target" "policy-min-support"
+          "thought" (hash-ref spec "thought")
+          "meta" spec
+          "parents" (list))))
+
+(define (rebind-ops spec)
+  (list
+    (list "mutate:rebind" "policy-name"
+          (string-append "(lambda () \"" (hash-ref spec "name") "\")")
+          "policy-keep")
+    (list "mutate:rebind" "policy-min-support"
+          (string-append "(lambda () " (number->string (hash-ref spec "min")) ")")
+          "policy-keep")
+    (list "mutate:rebind" "policy-question-fake?"
+          (string-append "(lambda () " (if (hash-ref spec "fake") "#t" "#f") ")")
+          "policy-keep")
+    (list "mutate:rebind" "policy-reaction-bias"
+          (string-append "(lambda () " (hash-ref spec "bias") ")")
+          "policy-keep")))
+
+(define (restore-source! src snap)
+  (if (and (string? src) (set-code src))
+    (begin (eval-current) (set! active-source src) #t)
+    (begin
+      (try (ast:restore snap) (catch (e) #f))
+      (try (eval-current) (catch (e) #f))
+      #f)))
+
+(define (publish-spec! spec src previous)
+  (mutate:safe-yield)
+  (if (not (mutate:boundary-safe?))
+    (hash "ok" #f "via" "boundary")
+    (let ((snap (ast:snapshot "policy-keep")))
+      (let ((batch (try (mutate:atomic-batch-safe (rebind-ops spec) "policy-keep")
+                        (catch (e) #f))))
+        (if (eq? batch #t)
+          (begin (eval-current) (hash "ok" #t "via" "atomic-batch"))
+          (if (and (string? src) (set-code src))
+            (begin (eval-current) (hash "ok" #t "via" "set-code"))
+            (begin
+              (restore-source! previous snap)
+              (hash "ok" #f "via" "fail"))))))))
+
+(define (gate-symbol)
+  (try (agent:check (agent:observe "policy-min-support"))
+       (catch (e) 'commit)))
+
+(define (gate-name g)
+  (cond
+    ((or (eq? g 'escalate) (equal? g "escalate")) "escalate")
+    ((or (eq? g 'back-off) (equal? g "back-off")) "back-off")
+    (else "commit")))
+
+(define (accept-gate s c ev)
+  (string=? (gate-name (gate-symbol)) "commit"))
+
+(define (eval-report signals feedback base)
+  (let ((now (score-current signals feedback)))
+    (hash "status" "ok"
+          "objectives" (hash "agreement" (hash-ref now "total" 0.0)
+                             "heldout" (hash-ref now "heldout" 0.0))
+          "constraints" (hash "regression" (if (better? now base) 0.0 1.0))
+          "behavior" (hash "labeled" (* 1.0 (hash-ref now "labeled" 0))))))
+
+(define (obj-of trial key)
+  (hash-ref (hash-ref trial "objectives" (hash)) key 0.0))
+
+(define (trial-row arm decision via reason trial base)
+  (hash "arm" arm
+        "decision" decision
+        "via" via
+        "reason" reason
+        "agreement" (obj-of trial "agreement")
+        "heldout" (obj-of trial "heldout")
+        "base" (hash-ref base "total" 0.0)
+        "base_heldout" (hash-ref base "heldout" 0.0)
+        "isolated" (eq? (hash-ref trial "live-unchanged" #f) #t)
+        "ok" (string=? decision "KEEP")))
+
+(define (make-apply signals feedback base previous)
+  (lambda (s c)
+    (let ((spec (evo:candidate-meta c))
+          (src (evo:candidate-genome c)))
+      (let ((pub (publish-spec! spec src previous)))
+        (if (not (hash-ref pub "ok" #f))
+          #f
+          (let ((now (score-current signals feedback)))
+            (if (better? now base)
+              (begin
+                (set! publish-via (hash-ref pub "via" "atomic-batch"))
+                (set! active-source src)
+                #t)
+              (let ((snap (ast:snapshot "verify-restore")))
+                (if (and (string? src) (set-code src))
+                  (begin
+                    (eval-current)
+                    (let ((now2 (score-current signals feedback)))
+                      (if (better? now2 base)
+                        (begin
+                          (set! publish-via "set-code")
+                          (set! active-source src)
+                          #t)
+                        (begin
+                          (restore-source! previous snap)
+                          #f))))
+                  (begin
+                    (restore-source! previous snap)
+                    #f))))))))))
+
+(define (try-arm search spec signals feedback base)
+  (let ((arm (hash-ref spec "arm"))
+        (cand (make-cand spec)))
+    (let ((trial (evo:trial cand
+                            (hash "timeout-ms" 8000
+                                  "apply" (lambda (c)
+                                            (if (set-code (evo:candidate-genome c))
+                                              (begin (eval-current) #t)
+                                              #f))
+                                  "evaluate" (lambda (c)
+                                               (eval-report signals feedback base))))))
+      (if (not (and (hash? trial) (evo:trial-ok? trial)))
+        (trial-row arm "ROLLBACK" "trial-error"
+                   (let ((err (if (hash? trial) (hash-ref trial "error" "trial") "trial")))
+                     (if (string? err) err "trial"))
+                   (if (hash? trial) trial (hash))
+                   base)
+        (begin
+          (evo:tell! search (list cand) (list trial))
+          (cond
+            ((not (evo:feasible? trial))
+             (evo:commit! search cand trial)
+             (trial-row arm "ROLLBACK" "infeasible" "未严格优于当前策略" trial base))
+            ((not (string=? (gate-name (gate-symbol)) "commit"))
+             (evo:record! arm "ROLLBACK" "agent-gate"
+                          (hash "gate" (gate-name (gate-symbol))) "" 0)
+             (trial-row arm "ROLLBACK" "gate" "变异边界检查拒绝提交" trial base))
+            (else
+             (let ((ok (evo:commit! search cand trial)))
+               (if ok
+                 (trial-row arm "KEEP" publish-via "同意率更高，已提交" trial base)
+                 (trial-row arm "ROLLBACK" "apply-failed" "发布或复核失败，已恢复" trial base))))))))))
+
+(define (run-trials signals feedback base previous)
+  (let ((search (evo:search
+                  (hash "algo" "insight-policy"
+                        "seed" 7
+                        "budget" 4
+                        "pop" 1
+                        "target" "policy-min-support"
+                        "objectives" (list (cons "agreement" "max")
+                                           (cons "heldout" "max"))
+                        "constraints" (list "regression")
+                        "accept" accept-gate
+                        "apply" (make-apply signals feedback base previous))))
+        (p0 (hash-set (evo:policy "ucb" (quote ())) "arms" (ucb-rows))))
+    (let loop ((p p0) (left 2) (trials (list)) (kept #f))
+      (if (or (<= left 0) kept)
+        (hash "trials" (reverse trials) "kept" kept)
+        (let* ((sel (evo:policy-select p))
+               (arm (if (pair? sel) (car sel) #f))
+               (p2 (if (and (pair? sel) (pair? (cdr sel))) (car (cdr sel)) p))
+               (spec (spec-of arm)))
+          (if (not spec)
+            (hash "trials" (reverse trials) "kept" kept)
+            (let ((step (try-arm search spec signals feedback base)))
+              (loop (evo:policy-report p2 arm (eq? (hash-ref step "decision" "") "KEEP"))
+                    (- left 1)
+                    (cons step trials)
+                    (or kept (string=? (hash-ref step "decision" "") "KEEP"))))))))))
+
+(define (stage-propose ctx)
+  (if (enough? (hash-ref ctx "feedback" (list)))
+    (hash-set (hash-set ctx "gate" "commit")
+              "specs"
+              (list (spec-overstrict) (spec-stricter)))
+    (hash-set (hash-set ctx "gate" "back-off") "specs" (list))))
+
+(define (propose-via-fiber ctx)
+  (let ((ch (channel:create 1)))
+    (let ((fid (try (fiber:spawn
+                      (lambda ()
+                        (channel:send ch
+                                      (try (stage-propose ctx)
+                                           (catch (e)
+                                             (hash-set ctx "gate" "escalate"))))))
+                    (catch (e) 0))))
+      (if (and (number? fid) (> fid 0))
+        (channel:recv ch)
+        (stage-propose ctx)))))
+
+(define (stage-check ctx)
+  (let ((agent (gate-name (gate-symbol)))
+        (gate (hash-ref ctx "gate" "")))
+    (cond
+      ((string=? gate "back-off")
+       (hash-set ctx "decision" "BACK-OFF"))
+      ((or (string=? gate "escalate") (string=? agent "escalate"))
+       (hash-set (hash-set ctx "gate" "escalate") "decision" "ESCALATE"))
+      ((string=? agent "back-off")
+       (hash-set (hash-set ctx "gate" "back-off") "decision" "BACK-OFF"))
+      (else
+       (let ((ran (run-trials (hash-ref ctx "signals" (list))
+                              (hash-ref ctx "feedback" (list))
+                              (hash-ref ctx "base" (hash))
+                              (hash-ref ctx "previous" ""))))
+         (hash-set (hash-set (hash-set ctx "trials" (hash-ref ran "trials" (list)))
+                             "kept" (hash-ref ran "kept" #f))
+                   "decision" (if (hash-ref ran "kept" #f) "KEEP" "ROLLBACK")))))))
+
+(define (evolve-ctx signals feedback base previous)
+  (orch:pipeline
+    (list propose-via-fiber stage-check)
+    (hash "signals" signals
+          "feedback" feedback
+          "base" base
+          "previous" previous
+          "gate" "commit"
+          "trials" (list)
+          "kept" #f
+          "decision" "ROLLBACK")))
+
+(define (saved-version version decision)
+  (hash "version" version
+        "name" (policy-name)
+        "source" active-source
+        "decision" decision))
+
+(define (history-event version decision reason arm parent)
+  (hash "version" version
+        "decision" decision
+        "reason" reason
+        "arm" arm
+        "parent_version" parent
+        "name" (policy-name)
+        "source" active-source))
+
+(define (attach-event body version decision reason arm parent saved?)
+  (let ((with-ev (hash-set body "history_event"
+                           (history-event version decision reason arm parent))))
+    (if saved?
+      (hash-set with-ev "saved_version" (saved-version version decision))
+      with-ev)))
+
+(define (do-observe signals feedback version)
+  (let ((base (score-current signals feedback))
+        (fresh (= version 0)))
+    (let ((ver (if fresh 1 version))
+          (body (present signals feedback (if fresh 1 version)
+                         (if fresh "SEED" "NONE")
+                         (if fresh "装入种子策略：单条信号即可晋升，问句也视为真实需求，反应数权重大。"
+                             "按当前策略重新观察，没有改策略。")
+                         "commit"
+                         (list)
+                         base
+                         base)))
+      (if fresh
+        (begin
+          (evo:record! "insight-policy" "SEED" "seed" (hash "version" 1) "" 0)
+          (attach-event body ver "SEED" "种子策略" "seed" 0 #t))
+        body))))
+
+(define (do-evolve signals feedback version)
+  (let* ((ver (if (>= version 1) version 1))
+         (base (score-current signals feedback))
+         (out (evolve-ctx signals feedback base active-source))
+         (decision (hash-ref out "decision" "ROLLBACK"))
+         (trials (hash-ref out "trials" (list)))
+         (gate (hash-ref out "gate" "commit")))
+    (cond
+      ((string=? decision "BACK-OFF")
+       (begin
+         (evo:record! "insight-policy" "ROLLBACK" "back-off: need 1 deny and 2 confirms"
+                      (hash "confirms" (count-verdict feedback "confirm")
+                            "denies" (count-verdict feedback "deny"))
+                      "" 0)
+         (present signals feedback ver "BACK-OFF"
+                  "证据不足：至少 1 条否认和 2 条确认才会试策略变体。这次只记下反馈。"
+                  "back-off" (list) base base)))
+      ((string=? decision "ESCALATE")
+       (begin
+         (evo:record! "insight-policy" "ROLLBACK" "escalate" (hash "gate" gate) "" 0)
+         (present signals feedback ver "ESCALATE"
+                  "变异检查要求升级，没有改策略。"
+                  "escalate" (list) base base)))
+      ((string=? decision "KEEP")
+       (let* ((now (score-current signals feedback))
+              (arm (let loop ((xs trials))
+                     (if (null? xs) ""
+                       (if (string=? (hash-ref (car xs) "decision" "") "KEEP")
+                         (hash-ref (car xs) "arm" "")
+                         (loop (cdr xs))))))
+              (reason (string-append "保留更优策略，同意率 "
+                                     (fmt-rate (hash-ref now "total" 0.0))
+                                     " > 基线 "
+                                     (fmt-rate (hash-ref base "total" 0.0))
+                                     "。"))
+              (body (present signals feedback (+ ver 1) "KEEP" reason
+                             "commit" trials now base)))
+         (attach-event body (+ ver 1) "KEEP" reason arm ver #t)))
+      (else
+       (present signals feedback ver "ROLLBACK"
+                (string-append "候选都没有严格优于基线 "
+                               (fmt-rate (hash-ref base "total" 0.0))
+                               "，已回滚。")
+                gate trials base base)))))
+
+(define (do-rollback input signals feedback version)
+  (let ((src (hash-ref input "rollback_source" ""))
+        (to (hash-ref input "rollback_to" 0)))
+    (if (not (and (string? src) (> (string-length src) 0) (integer? to) (>= to 1)))
+      (hash "ok" #f "error" "缺少要回滚的策略版本")
+      (begin
+        (mutate:safe-yield)
+        (if (not (mutate:boundary-safe?))
+          (hash "ok" #f "error" "MutationBoundary 正被占用，拒绝回滚")
+          (let ((snap (ast:snapshot "user-rollback")))
+            (if (not (set-code src))
+              (begin
+                (try (ast:restore snap) (catch (e) #f))
+                (hash "ok" #f "error" "set-code 失败，已保持原策略"))
+              (begin
+                (eval-current)
+                (set! active-source src)
+                (set! publish-via "set-code")
+                (evo:record! "insight-policy" "ROLLBACK" "user-restore"
+                             (hash "version" to) "" 0)
+                (let ((now (score-current signals feedback))
+                      (body (present signals feedback to "ROLLBACK"
+                                     (string-append "已回滚到策略版本 " (number->string to) "。")
+                                     "commit" (list) now now)))
+                  (attach-event body to "ROLLBACK" "user-restore" "restore" version #f))))))))))
+
+(define (dispatch input)
+  (let ((op (hash-ref input "op" "observe"))
+        (signals (as-list (hash-ref input "signals" (list))))
+        (feedback (as-list (hash-ref input "feedback" (list)))))
+    (cond
+      ((string=? op "rollback")
+       (do-rollback input signals feedback (incoming-version input)))
+      ((string=? op "evolve")
+       (begin
+         (if (not (install! (incoming-source input)))
+           (hash "ok" #f "error" "无法装入当前策略")
+           (do-evolve signals feedback (incoming-version input)))))
+      (else
+       (begin
+         (if (not (install! (incoming-source input)))
+           (hash "ok" #f "error" "无法装入当前策略")
+           (do-observe signals feedback (incoming-version input))))))))
+
+(define (emit v)
+  (let ((text (string-append (json-encode v) "\n")))
+    (let ((outp (getenv "INSIGHT_OUT")))
+      (if (and (string? outp) (> (string-length outp) 0))
+        (write-file outp text)
+        #f))
+    (display text)))
+
+(define (main)
+  (load-lib!)
+  (let ((path (getenv "INSIGHT_IN")))
+    (if (not (and (string? path) (> (string-length path) 0)))
+      (emit (hash "ok" #f "error" "INSIGHT_IN 未设置"))
+      (let ((raw (try (read-file path) (catch (e) ""))))
+        (let ((input (try (json-parse raw) (catch (e) #f))))
+          (if (not (hash? input))
+            (emit (hash "ok" #f "error" "输入不是 JSON 对象"))
+            (emit (try (dispatch input)
+                       (catch (e) (hash "ok" #f "error" (err-text e)))))))))))
+
+(main)

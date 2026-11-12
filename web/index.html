@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>需求洞察</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="top">
+    <div>
+      <p class="eyebrow">开源产品 · GitHub issue</p>
+      <h1>需求洞察</h1>
+      <p class="lede">策略本身是可改写的 Aura 代码。反馈先被记下，证据够了才在分叉世界线上试候选，只有严格更好才 KEEP。</p>
+    </div>
+    <div class="knobs" id="knobs"></div>
+  </header>
+
+  <section class="status" id="status" aria-live="polite"></section>
+
+  <main class="layout">
+    <section>
+      <div class="section-head">
+        <h2>已晋升的假设</h2>
+        <button type="button" id="reset" class="ghost">重置示例</button>
+      </div>
+      <div id="insights"></div>
+      <h2 class="later">未晋升 / 伪需求</h2>
+      <div id="forgotten"></div>
+    </section>
+    <aside>
+      <h2>策略版本</h2>
+      <p class="hint">种子故意放得很松：一条 issue 就能晋升，提问也算真实需求，反应数会把热门问题顶上去。</p>
+      <ol id="events" class="timeline"></ol>
+      <h2 class="later">本轮试验</h2>
+      <ol id="trials" class="trials"></ol>
+      <h2 class="later">审计</h2>
+      <ol id="audit" class="audit"></ol>
+    </aside>
+  </main>
+  <footer>
+    <p>在线 GitHub 拉取是可选的，需要在进程环境里设置 <code>GITHUB_TOKEN</code>。没有 token 时只用 <code>fixtures/issues.json</code>。当前进程以 <code>AURA_SANDBOX=off</code> 调用 Aura v0.2.0，因为 restricted 沙箱不允许 trial 子工作区改策略。</p>
+  </footer>
+  <script src="/app.js"></script>
+</body>
+</html>
